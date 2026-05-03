@@ -1,0 +1,93 @@
+{
+  "theme": "Dark",
+  "archetype": "7 (Electric & Neon)",
+  "design_philosophy": "Cyberpunk sci-fi HUD UI with high-contrast neon colors on deep void backgrounds. Emphasis on holographic transparency, grid-based modular layouts, hard-edged containers, and futuristic typography.",
+  "colors": {
+    "background_primary": "#050509",
+    "background_secondary": "#0A0A15",
+    "surface": "#121220",
+    "surface_glass": "rgba(0, 240, 255, 0.05)",
+    "primary": "#00F0FF",
+    "primary_glow": "rgba(0, 240, 255, 0.5)",
+    "secondary": "#FF003C",
+    "accent_purple": "#9D4CDD",
+    "success_neon": "#39FF14",
+    "warning_hazard": "#FCEE0A",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#8A8A9E",
+    "border_dim": "rgba(0, 240, 255, 0.2)",
+    "border_active": "#00F0FF"
+  },
+  "typography": {
+    "font_families": {
+      "heading": "Orbitron, Share Tech Mono, or System Monospace",
+      "body": "Rajdhani, Roboto Mono, or System Sans-Serif"
+    },
+    "scale": {
+      "h1": "text-4xl (32px), tracking-tighter, uppercase",
+      "h2": "text-2xl (24px), tracking-tight, uppercase",
+      "h3": "text-xl (20px), uppercase",
+      "body": "text-base (16px)",
+      "label": "text-xs (12px), tracking-widest, uppercase"
+    }
+  },
+  "spacing_and_layout": {
+    "screen_padding": "16px",
+    "container_gap": "20px",
+    "radius": "0px or minimal 4px (hard edges preferred for cyberpunk)",
+    "hud_padding": "12px with 1px neon borders"
+  },
+  "component_guidelines": {
+    "buttons": {
+      "primary": "Transparent background, solid neon border (e.g., #00F0FF), uppercase text. On press: fill with neon color and black text. Consider adding a small angle cut effect if achievable via styles.",
+      "secondary": "No border, neon text, chevron indicators (e.g., '> CLICK HERE')."
+    },
+    "status_bars": {
+      "style": "HUD segmented progress bars. Outer container has 1px border. 6 Bars: Health (Red), Hunger (Orange), Hygiene (Cyan), Energy (Yellow), Social (Purple), Mood (Magenta)."
+    },
+    "cards_and_panels": {
+      "style": "Dark surface (#121220) with a 1px border (#00F0FF at 20% opacity). Use hard rectangular shapes."
+    },
+    "inputs": {
+      "style": "Bottom border only or fully boxed with hard 0px radius. Focus state turns border bright neon cyan or magenta."
+    },
+    "bottom_tab_navigation": {
+      "style": "Dark background (#050509) with top border (#00F0FF 30% opacity). Active tab text/icon glows cyan."
+    }
+  },
+  "motion_and_interactions": {
+    "transitions": "Snappy, sudden changes rather than slow easing (mimics digital glitches/HUD updates).",
+    "active_states": "Buttons and list items glow or inverse colors on press/active."
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://images.pexels.com/photos/20278554/pexels-photo-20278554.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "category": "login_background",
+        "description": "Dark neon city night, ideal for the background of the Login/Signup screen. Apply a dark overlay (rgba(5,5,9,0.85)) to ensure form readability."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1684254285146-1b8b8db00a8b?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2ODl8MHwxfHNlYXJjaHwxfHxuZW9uJTIwcG9ydHJhaXQlMjBmYWNlfGVufDB8fHx8MTc3NzgzNzgyMnww&ixlib=rb-4.1.0&q=85",
+        "category": "character_avatar",
+        "description": "Neon lit portrait for the Character screen avatar. Place inside a cyberpunk frame/border."
+      }
+    ]
+  },
+  "specific_screens": {
+    "login_signup": "Full screen background image with heavy dark overlay. Holographic logo or title ('LIFETRACK_OS'). Inputs with neon accents.",
+    "character_screen": "Avatar at top, framed by HUD elements. 6 Status bars underneath (Health, Hunger, Hygiene, Energy, Social, Mood) with [-] and [+] buttons to adjust. Overall Level and XP displayed prominently in a futuristic badge.",
+    "skills_screen": "Customizable list of skills. Each skill has an XP progress bar and current 'giant' level. 'Add Skill' button with hacker-aesthetic.",
+    "quests_screen": "List of user-created quests. Checkboxes are neon squares. Completion strikes through text and triggers an XP reward. Option to create quests with assigned XP.",
+    "profile": "Settings, log out, user stats overview."
+  },
+  "instructions_to_main_agent": [
+    "Build this as an Expo React Native mobile app using .js files ONLY.",
+    "Use standard React Native components (View, Text, TextInput, TouchableOpacity, ScrollView, FlatList).",
+    "Implement styling via StyleSheet.create() or inline styles. Do NOT use Tailwind classes unless Nativewind is explicitly configured in the project.",
+    "Add 'testID' attributes to all interactive elements for testing, using kebab-case role-based names (e.g., testID='login-submit-button').",
+    "Status bars must be interactable with visible +/- controls on the Character Screen.",
+    "Ensure the app implements bottom tab navigation mapping to Character, Skills, Quests, and Profile.",
+    "State management can be mocked or local for the MVP, but auth and data structures must be in place.",
+    "Maintain the cyberpunk dark theme rigidly. No bright white backgrounds anywhere."
+  ]
+}
