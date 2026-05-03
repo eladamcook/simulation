@@ -7,8 +7,8 @@ Cyberpunk-themed gamified life-tracking Expo (React Native) mobile app with **us
 ### Solo
 - **Auth**: JWT email/password; AsyncStorage Bearer token.
 - **Character**: Renamable, HUD avatar, overall level, 6 status bars (Health/Hunger/Hygiene/Energy/Social/Mood) with -10/-5/+5/+10 controls clamped 0–100.
-- **Skill Trees**: Fully custom skills (name, color, description). Per-skill progression LV1→2 = 100 XP, +150 XP per subsequent level (giant levels).
-- **Quests**: Create personal quests with XP rewards. Completing a skill-linked quest **auto-awards XP to that skill** with toast confirmation.
+- **Skill Trees (branching)**: Fully custom skills with **unlimited-depth sub-skills** and **cascading XP**. Each skill has its own `own_xp` (from quests/manual) and a computed `total_xp` = own_xp + Σ(descendants' total_xp). Each skill levels independently from its total_xp (LV1→2 = 100 XP, +150 per level — giant levels). Add Sub-skill via `SUB` button. Cycle protection on parent reassignment. Cascade-delete on removal.
+- **Quests**: Create personal quests with XP rewards. Skill picker includes **all skills (root + nested)**. Completing a skill-linked quest auto-awards XP to that exact skill — cascading bumps every ancestor.
 
 ### Social (NEW)
 - **Friend Codes**: Every user gets a unique 6-char code (A-Z, 0-9) auto-generated on register.
