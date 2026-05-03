@@ -952,3 +952,10 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+
+if__name__=="__main":
+    import uvicorn
+    import os
+    port=int(os.environ.get("PORT",10000))
+    uvicorn.run(app, host="0.0.0.0",port=port)
