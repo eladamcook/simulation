@@ -7,6 +7,7 @@ type User = {
   email: string;
   character_name: string;
   status_bars: Record<string, number>;
+  friend_code?: string;
 };
 
 type AuthCtx = {

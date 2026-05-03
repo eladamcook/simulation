@@ -68,6 +68,29 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+import secrets, string
+
+def gen_friend_code() -> str:
+    chars = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(6))
+
+
+async def ensure_friend_code(user_id: str) -> str:
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "friend_code": 1})
+    if user and user.get("friend_code"):
+        return user["friend_code"]
+    while True:
+        code = gen_friend_code()
+        exists = await db.users.find_one({"friend_code": code})
+        if not exists:
+            await db.users.update_one({"id": user_id}, {"$set": {"friend_code": code}})
+            return code
+
+
+def friendship_pair(a: str, b: str):
+    return tuple(sorted([a, b]))
+
+
 async def get_current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
     if not creds or not creds.credentials:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -147,6 +170,19 @@ class QuestUpdate(BaseModel):
     xp_reward: Optional[int] = None
 
 
+class FriendRequestCreate(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+class QuestAssignCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = ""
+    skill_id: Optional[str] = None
+    xp_reward: int = Field(ge=1, le=10000, default=50)
+    to_user_id: str
+    deadline: Optional[str] = None  # ISO datetime string
+
+
 # ---------------- Auth Routes ----------------
 @api_router.post("/auth/register", response_model=AuthResponse)
 async def register(payload: RegisterRequest):
@@ -155,12 +191,18 @@ async def register(payload: RegisterRequest):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     user_id = str(uuid.uuid4())
+    # Generate unique friend code
+    while True:
+        code = gen_friend_code()
+        if not await db.users.find_one({"friend_code": code}):
+            break
     user_doc = {
         "id": user_id,
         "email": email,
         "password_hash": hash_password(payload.password),
         "character_name": payload.character_name.strip(),
         "status_bars": default_status_bars(),
+        "friend_code": code,
         "created_at": now_iso(),
     }
     await db.users.insert_one(user_doc)
@@ -176,6 +218,10 @@ async def login(payload: LoginRequest):
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    # Backfill friend code if missing
+    if not user.get("friend_code"):
+        await ensure_friend_code(user["id"])
+        user = await db.users.find_one({"email": email})
     token = create_access_token(user["id"], email)
     user.pop("_id", None)
     user.pop("password_hash", None)
@@ -184,6 +230,8 @@ async def login(payload: LoginRequest):
 
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
+    if not user.get("friend_code"):
+        user["friend_code"] = await ensure_friend_code(user["id"])
     return user
 
 
@@ -320,6 +368,46 @@ async def add_xp(skill_id: str, payload: XPGain, user: dict = Depends(get_curren
 
 
 # ---------------- Quests Routes ----------------
+RELATIONSHIP_DEFAULT = 50
+
+
+def relationship_delta_for(xp: int) -> int:
+    return max(1, xp // 5)
+
+
+async def adjust_relationship(user_a: str, user_b: str, delta: int) -> Optional[int]:
+    a, b = sorted([user_a, user_b])
+    f = await db.friendships.find_one({"user_a": a, "user_b": b, "status": "accepted"})
+    if not f:
+        return None
+    new_rel = max(0, min(100, f.get("relationship", RELATIONSHIP_DEFAULT) + delta))
+    await db.friendships.update_one({"user_a": a, "user_b": b}, {"$set": {"relationship": new_rel}})
+    return new_rel
+
+
+async def auto_expire_quests(user_id: str):
+    """Mark expired any past-deadline pending/accepted social quests assigned to user."""
+    now = datetime.now(timezone.utc)
+    cursor = db.quests.find({
+        "to_user_id": user_id,
+        "deadline": {"$ne": None},
+        "assignment_status": {"$in": ["pending", "accepted"]},
+    })
+    async for q in cursor:
+        try:
+            dl = datetime.fromisoformat(q["deadline"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dl < now:
+            await db.quests.update_one(
+                {"id": q["id"]},
+                {"$set": {"assignment_status": "expired", "completed": False}},
+            )
+            from_uid = q.get("from_user_id")
+            if from_uid:
+                await adjust_relationship(from_uid, user_id, -relationship_delta_for(q.get("xp_reward", 0)))
+
+
 def serialize_quest(q: dict) -> dict:
     return {
         "id": q["id"],
@@ -330,14 +418,40 @@ def serialize_quest(q: dict) -> dict:
         "completed": q.get("completed", False),
         "completed_at": q.get("completed_at"),
         "created_at": q.get("created_at"),
+        "from_user_id": q.get("from_user_id"),
+        "to_user_id": q.get("to_user_id"),
+        "deadline": q.get("deadline"),
+        "assignment_status": q.get("assignment_status", "self"),
+        "owner_user_id": q.get("user_id"),
     }
+
+
+async def enrich_quest(q: dict) -> dict:
+    base = serialize_quest(q)
+    # Attach from_user/to_user character_name for display
+    if q.get("from_user_id"):
+        u = await db.users.find_one({"id": q["from_user_id"]}, {"_id": 0, "character_name": 1})
+        base["from_character_name"] = (u or {}).get("character_name")
+    if q.get("to_user_id"):
+        u = await db.users.find_one({"id": q["to_user_id"]}, {"_id": 0, "character_name": 1})
+        base["to_character_name"] = (u or {}).get("character_name")
+    return base
 
 
 @api_router.get("/quests")
 async def list_quests(user: dict = Depends(get_current_user)):
-    quests = await db.quests.find({"user_id": user["id"]}, {"_id": 0}).to_list(1000)
+    await auto_expire_quests(user["id"])
+    # My self-quests + quests assigned TO me by friends + quests I assigned to friends
+    cursor = db.quests.find({
+        "$or": [
+            {"user_id": user["id"]},
+            {"to_user_id": user["id"]},
+            {"from_user_id": user["id"]},
+        ]
+    }, {"_id": 0})
+    quests = await cursor.to_list(2000)
     quests.sort(key=lambda q: (q.get("completed", False), q.get("created_at", "")))
-    return [serialize_quest(q) for q in quests]
+    return [await enrich_quest(q) for q in quests]
 
 
 @api_router.post("/quests")
@@ -349,7 +463,7 @@ async def create_quest(payload: QuestCreate, user: dict = Depends(get_current_us
     quest_id = str(uuid.uuid4())
     doc = {
         "id": quest_id,
-        "user_id": user["id"],
+        "user_id": user["id"],  # owner / recipient (self-quest)
         "title": payload.title.strip(),
         "description": (payload.description or "").strip(),
         "skill_id": payload.skill_id,
@@ -357,10 +471,14 @@ async def create_quest(payload: QuestCreate, user: dict = Depends(get_current_us
         "completed": False,
         "completed_at": None,
         "created_at": now_iso(),
+        "from_user_id": None,
+        "to_user_id": None,
+        "deadline": None,
+        "assignment_status": "self",
     }
     await db.quests.insert_one(doc)
     doc.pop("_id", None)
-    return serialize_quest(doc)
+    return await enrich_quest(doc)
 
 
 @api_router.put("/quests/{quest_id}")
@@ -368,63 +486,299 @@ async def update_quest(quest_id: str, payload: QuestUpdate, user: dict = Depends
     quest = await db.quests.find_one({"id": quest_id, "user_id": user["id"]}, {"_id": 0})
     if not quest:
         raise HTTPException(status_code=404, detail="Quest not found")
+    if quest.get("assignment_status") not in (None, "self"):
+        raise HTTPException(status_code=400, detail="Cannot edit a friend-assigned quest")
     update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
     if update:
         await db.quests.update_one({"id": quest_id}, {"$set": update})
     quest = await db.quests.find_one({"id": quest_id}, {"_id": 0})
-    return serialize_quest(quest)
+    return await enrich_quest(quest)
 
 
 @api_router.delete("/quests/{quest_id}")
 async def delete_quest(quest_id: str, user: dict = Depends(get_current_user)):
-    res = await db.quests.delete_one({"id": quest_id, "user_id": user["id"]})
+    # Only the owner (user_id) can delete; friend-assigned quests can be deleted by recipient too
+    res = await db.quests.delete_one({"id": quest_id, "$or": [{"user_id": user["id"]}, {"to_user_id": user["id"]}, {"from_user_id": user["id"]}]})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Quest not found")
     return {"deleted": True}
 
 
+@api_router.post("/quests/{quest_id}/accept")
+async def accept_quest(quest_id: str, user: dict = Depends(get_current_user)):
+    quest = await db.quests.find_one({"id": quest_id, "to_user_id": user["id"]}, {"_id": 0})
+    if not quest:
+        raise HTTPException(status_code=404, detail="Quest not found")
+    if quest.get("assignment_status") != "pending":
+        raise HTTPException(status_code=400, detail="Quest cannot be accepted in its current state")
+    await db.quests.update_one({"id": quest_id}, {"$set": {"assignment_status": "accepted"}})
+    quest = await db.quests.find_one({"id": quest_id}, {"_id": 0})
+    return await enrich_quest(quest)
+
+
+@api_router.post("/quests/{quest_id}/decline")
+async def decline_quest(quest_id: str, user: dict = Depends(get_current_user)):
+    quest = await db.quests.find_one({"id": quest_id, "to_user_id": user["id"]}, {"_id": 0})
+    if not quest:
+        raise HTTPException(status_code=404, detail="Quest not found")
+    if quest.get("assignment_status") not in ("pending", "accepted"):
+        raise HTTPException(status_code=400, detail="Quest cannot be declined")
+    await db.quests.update_one({"id": quest_id}, {"$set": {"assignment_status": "declined"}})
+    new_rel = None
+    if quest.get("from_user_id"):
+        new_rel = await adjust_relationship(quest["from_user_id"], user["id"], -relationship_delta_for(quest.get("xp_reward", 0)))
+    quest = await db.quests.find_one({"id": quest_id}, {"_id": 0})
+    return {"quest": await enrich_quest(quest), "relationship": new_rel}
+
+
 @api_router.post("/quests/{quest_id}/complete")
 async def complete_quest(quest_id: str, user: dict = Depends(get_current_user)):
-    quest = await db.quests.find_one({"id": quest_id, "user_id": user["id"]}, {"_id": 0})
+    # Quest can be self-quest (user_id == me) OR friend-quest (to_user_id == me)
+    quest = await db.quests.find_one({
+        "id": quest_id,
+        "$or": [{"user_id": user["id"]}, {"to_user_id": user["id"]}],
+    }, {"_id": 0})
     if not quest:
         raise HTTPException(status_code=404, detail="Quest not found")
     if quest.get("completed"):
         raise HTTPException(status_code=400, detail="Quest already completed")
+    is_friend_quest = quest.get("assignment_status") in ("pending", "accepted") and quest.get("from_user_id")
+    if is_friend_quest and quest.get("assignment_status") == "pending":
+        raise HTTPException(status_code=400, detail="Accept the quest before completing it")
+    new_status = "completed" if quest.get("assignment_status") and quest["assignment_status"] != "self" else quest.get("assignment_status", "self")
     await db.quests.update_one(
         {"id": quest_id},
-        {"$set": {"completed": True, "completed_at": now_iso()}},
+        {"$set": {"completed": True, "completed_at": now_iso(), "assignment_status": new_status}},
     )
     awarded_skill = None
+    # Recipient is whoever should get the XP (self-quest: user_id == me; friend quest: to_user_id == me)
+    recipient_id = user["id"]
     if quest.get("skill_id"):
-        skill = await db.skills.find_one({"id": quest["skill_id"], "user_id": user["id"]}, {"_id": 0})
+        skill = await db.skills.find_one({"id": quest["skill_id"], "user_id": recipient_id}, {"_id": 0})
         if skill:
             new_total = skill.get("total_xp", 0) + quest.get("xp_reward", 0)
             await db.skills.update_one({"id": skill["id"]}, {"$set": {"total_xp": new_total}})
             skill["total_xp"] = new_total
             awarded_skill = serialize_skill(skill)
+    new_rel = None
+    if is_friend_quest:
+        new_rel = await adjust_relationship(quest["from_user_id"], user["id"], +relationship_delta_for(quest.get("xp_reward", 0)))
     quest = await db.quests.find_one({"id": quest_id}, {"_id": 0})
-    return {"quest": serialize_quest(quest), "skill": awarded_skill}
+    return {"quest": await enrich_quest(quest), "skill": awarded_skill, "relationship": new_rel}
 
 
 @api_router.post("/quests/{quest_id}/uncomplete")
 async def uncomplete_quest(quest_id: str, user: dict = Depends(get_current_user)):
-    quest = await db.quests.find_one({"id": quest_id, "user_id": user["id"]}, {"_id": 0})
+    quest = await db.quests.find_one({
+        "id": quest_id,
+        "$or": [{"user_id": user["id"]}, {"to_user_id": user["id"]}],
+    }, {"_id": 0})
     if not quest:
         raise HTTPException(status_code=404, detail="Quest not found")
     if not quest.get("completed"):
         raise HTTPException(status_code=400, detail="Quest not completed")
+    # Roll back state
+    rollback_status = "accepted" if quest.get("from_user_id") else "self"
     await db.quests.update_one(
         {"id": quest_id},
-        {"$set": {"completed": False, "completed_at": None}},
+        {"$set": {"completed": False, "completed_at": None, "assignment_status": rollback_status}},
     )
-    # Roll back XP if a skill was attached
+    recipient_id = user["id"]
     if quest.get("skill_id"):
-        skill = await db.skills.find_one({"id": quest["skill_id"], "user_id": user["id"]}, {"_id": 0})
+        skill = await db.skills.find_one({"id": quest["skill_id"], "user_id": recipient_id}, {"_id": 0})
         if skill:
             new_total = max(0, skill.get("total_xp", 0) - quest.get("xp_reward", 0))
             await db.skills.update_one({"id": skill["id"]}, {"$set": {"total_xp": new_total}})
+    if quest.get("from_user_id"):
+        await adjust_relationship(quest["from_user_id"], user["id"], -relationship_delta_for(quest.get("xp_reward", 0)))
     quest = await db.quests.find_one({"id": quest_id}, {"_id": 0})
-    return serialize_quest(quest)
+    return await enrich_quest(quest)
+
+
+# ---------------- Friends Routes ----------------
+async def _get_friendship(user_a: str, user_b: str):
+    a, b = sorted([user_a, user_b])
+    return await db.friendships.find_one({"user_a": a, "user_b": b}, {"_id": 0})
+
+
+@api_router.post("/friends/request")
+async def send_friend_request(payload: FriendRequestCreate, user: dict = Depends(get_current_user)):
+    code = payload.code.upper().strip()
+    target = await db.users.find_one({"friend_code": code}, {"_id": 0, "id": 1, "character_name": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="No user with that code")
+    if target["id"] == user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot add yourself")
+    a, b = sorted([user["id"], target["id"]])
+    existing = await db.friendships.find_one({"user_a": a, "user_b": b})
+    if existing:
+        if existing.get("status") == "accepted":
+            raise HTTPException(status_code=400, detail="Already friends")
+        if existing.get("status") == "pending":
+            raise HTTPException(status_code=400, detail="Request already pending")
+    fid = str(uuid.uuid4())
+    doc = {
+        "id": fid,
+        "user_a": a,
+        "user_b": b,
+        "requested_by": user["id"],
+        "status": "pending",
+        "relationship": RELATIONSHIP_DEFAULT,
+        "created_at": now_iso(),
+    }
+    if existing:
+        await db.friendships.delete_one({"user_a": a, "user_b": b})
+    await db.friendships.insert_one(doc)
+    return {"id": fid, "status": "pending", "to_character_name": target["character_name"]}
+
+
+@api_router.get("/friends/requests")
+async def list_requests(user: dict = Depends(get_current_user)):
+    cursor = db.friendships.find({
+        "status": "pending",
+        "$or": [{"user_a": user["id"]}, {"user_b": user["id"]}],
+    }, {"_id": 0})
+    out_incoming, out_outgoing = [], []
+    async for f in cursor:
+        other_id = f["user_b"] if f["user_a"] == user["id"] else f["user_a"]
+        other = await db.users.find_one({"id": other_id}, {"_id": 0, "character_name": 1, "friend_code": 1})
+        item = {
+            "id": f["id"],
+            "other_user_id": other_id,
+            "other_character_name": (other or {}).get("character_name", "?"),
+            "other_friend_code": (other or {}).get("friend_code", ""),
+            "created_at": f["created_at"],
+        }
+        if f["requested_by"] == user["id"]:
+            out_outgoing.append(item)
+        else:
+            out_incoming.append(item)
+    return {"incoming": out_incoming, "outgoing": out_outgoing}
+
+
+@api_router.post("/friends/requests/{req_id}/accept")
+async def accept_request(req_id: str, user: dict = Depends(get_current_user)):
+    f = await db.friendships.find_one({"id": req_id}, {"_id": 0})
+    if not f or f["status"] != "pending":
+        raise HTTPException(status_code=404, detail="Request not found")
+    if user["id"] not in (f["user_a"], f["user_b"]) or f["requested_by"] == user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    await db.friendships.update_one({"id": req_id}, {"$set": {"status": "accepted", "accepted_at": now_iso()}})
+    return {"id": req_id, "status": "accepted"}
+
+
+@api_router.post("/friends/requests/{req_id}/decline")
+async def decline_request(req_id: str, user: dict = Depends(get_current_user)):
+    f = await db.friendships.find_one({"id": req_id}, {"_id": 0})
+    if not f or f["status"] != "pending":
+        raise HTTPException(status_code=404, detail="Request not found")
+    if user["id"] not in (f["user_a"], f["user_b"]):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    await db.friendships.delete_one({"id": req_id})
+    return {"deleted": True}
+
+
+@api_router.get("/friends")
+async def list_friends(user: dict = Depends(get_current_user)):
+    cursor = db.friendships.find({
+        "status": "accepted",
+        "$or": [{"user_a": user["id"]}, {"user_b": user["id"]}],
+    }, {"_id": 0})
+    friends = []
+    async for f in cursor:
+        other_id = f["user_b"] if f["user_a"] == user["id"] else f["user_a"]
+        other = await db.users.find_one({"id": other_id}, {"_id": 0, "character_name": 1, "friend_code": 1})
+        if not other:
+            continue
+        # Compute their level from skills
+        skills = await db.skills.find({"user_id": other_id}, {"_id": 0, "total_xp": 1}).to_list(1000)
+        total_xp = sum(s.get("total_xp", 0) for s in skills)
+        overall_level = 1 + total_xp // 500
+        friends.append({
+            "user_id": other_id,
+            "character_name": other["character_name"],
+            "friend_code": other.get("friend_code", ""),
+            "relationship": f.get("relationship", RELATIONSHIP_DEFAULT),
+            "overall_level": overall_level,
+            "total_xp": total_xp,
+            "since": f.get("accepted_at") or f.get("created_at"),
+        })
+    friends.sort(key=lambda x: -x["relationship"])
+    return friends
+
+
+@api_router.delete("/friends/{user_id}")
+async def unfriend(user_id: str, user: dict = Depends(get_current_user)):
+    a, b = sorted([user["id"], user_id])
+    res = await db.friendships.delete_one({"user_a": a, "user_b": b, "status": "accepted"})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not friends")
+    return {"deleted": True}
+
+
+@api_router.get("/users/{user_id}/profile")
+async def view_profile(user_id: str, user: dict = Depends(get_current_user)):
+    if user_id == user["id"]:
+        target = user
+    else:
+        f = await _get_friendship(user["id"], user_id)
+        if not f or f.get("status") != "accepted":
+            raise HTTPException(status_code=403, detail="Not friends")
+        target = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+    skills = await db.skills.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
+    total_xp = sum(s.get("total_xp", 0) for s in skills)
+    overall_level = 1 + total_xp // 500
+    relationship = None
+    if user_id != user["id"]:
+        f = await _get_friendship(user["id"], user_id)
+        relationship = (f or {}).get("relationship")
+    return {
+        "user_id": user_id,
+        "character_name": target.get("character_name"),
+        "friend_code": target.get("friend_code"),
+        "status_bars": target.get("status_bars", default_status_bars()),
+        "overall_level": overall_level,
+        "total_xp": total_xp,
+        "next_level_xp": overall_level * 500,
+        "skills": [serialize_skill(s) for s in skills],
+        "relationship": relationship,
+    }
+
+
+@api_router.post("/friends/{friend_user_id}/quests")
+async def assign_quest_to_friend(friend_user_id: str, payload: QuestAssignCreate, user: dict = Depends(get_current_user)):
+    if payload.to_user_id != friend_user_id:
+        raise HTTPException(status_code=400, detail="to_user_id mismatch")
+    f = await _get_friendship(user["id"], friend_user_id)
+    if not f or f.get("status") != "accepted":
+        raise HTTPException(status_code=403, detail="Not friends")
+    if payload.skill_id:
+        # Verify recipient owns the skill
+        skill = await db.skills.find_one({"id": payload.skill_id, "user_id": friend_user_id})
+        if not skill:
+            raise HTTPException(status_code=400, detail="Skill not found on recipient")
+    quest_id = str(uuid.uuid4())
+    doc = {
+        "id": quest_id,
+        "user_id": friend_user_id,  # owner = recipient
+        "title": payload.title.strip(),
+        "description": (payload.description or "").strip(),
+        "skill_id": payload.skill_id,
+        "xp_reward": payload.xp_reward,
+        "completed": False,
+        "completed_at": None,
+        "created_at": now_iso(),
+        "from_user_id": user["id"],
+        "to_user_id": friend_user_id,
+        "deadline": payload.deadline,
+        "assignment_status": "pending",
+    }
+    await db.quests.insert_one(doc)
+    doc.pop("_id", None)
+    return await enrich_quest(doc)
+
 
 
 # ---------------- Health ----------------
@@ -447,21 +801,33 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
+    await db.users.create_index("friend_code", unique=True, sparse=True)
     await db.skills.create_index("user_id")
     await db.quests.create_index("user_id")
+    await db.quests.create_index("to_user_id")
+    await db.quests.create_index("from_user_id")
+    await db.friendships.create_index([("user_a", 1), ("user_b", 1)], unique=True)
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@nexus.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
     if existing is None:
+        # Generate unique friend code
+        while True:
+            code = gen_friend_code()
+            if not await db.users.find_one({"friend_code": code}):
+                break
         await db.users.insert_one({
             "id": str(uuid.uuid4()),
             "email": admin_email,
             "password_hash": hash_password(admin_password),
             "character_name": "ADMIN_OS",
             "status_bars": default_status_bars(),
+            "friend_code": code,
             "created_at": now_iso(),
         })
+    elif not existing.get("friend_code"):
+        await ensure_friend_code(existing["id"])
 
 
 @app.on_event("shutdown")

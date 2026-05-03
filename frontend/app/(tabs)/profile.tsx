@@ -56,6 +56,11 @@ export default function ProfileScreen() {
           <Text style={styles.value}>{user?.character_name || "—"}</Text>
         </View>
 
+        <View style={styles.card}>
+          <Text style={styles.label}>FRIEND CODE</Text>
+          <Text testID="profile-friend-code" style={[styles.value, { letterSpacing: 6 }]}>{user?.friend_code || "------"}</Text>
+        </View>
+
         <Text style={styles.section}>// STATISTICS</Text>
 
         <View style={styles.statsGrid}>
