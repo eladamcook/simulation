@@ -1,25 +1,38 @@
 # LIFETRACK_OS — Product Requirements
 
 ## Overview
-A cyberpunk-themed gamified life-tracking Expo (React Native) mobile app. Users create a character, track 6 customizable vital stats, build a fully custom skill tree, and complete user-authored quests that award XP toward giant skill levels.
+Cyberpunk-themed gamified life-tracking Expo (React Native) mobile app with **user-to-user social layer**. Players create a character, track 6 vital stats, build custom skill trees, complete user-authored quests, **connect with other players via 6-char friend codes, build relationship bars, and assign quests to each other** that affect both XP and relationships.
 
-## Core Features (MVP)
-- **Auth**: JWT email/password (register, login, /me); token stored in AsyncStorage; Bearer auth on all protected routes.
-- **Character Screen**: Renamable character, avatar HUD frame, overall level + XP badge, 6 adjustable status bars (Health, Hunger, Hygiene, Energy, Social, Mood) each with -10/-5/+5/+10 controls, clamped 0–100.
-- **Skill Trees**: Fully user-customizable skills (name, description, color). Each skill has its own level progression (LV1→LV2 at 100 XP, LV2→LV3 at 250 XP, +150 XP each subsequent level — "giant levels"). +25 / +100 quick-add XP buttons + edit/delete.
-- **Quests**: User-created quests with title, description, XP reward, optional assigned skill. Mark complete → XP awarded to skill; uncomplete → XP rolled back. Edit/delete supported.
-- **Profile**: Email, character name, stats (skills/quests/completed/total XP), logout.
-- **Cyberpunk UI**: Neon cyan/magenta/purple on deep void backgrounds, hard edges, HUD-style segmented status bars, monospace-feel typography.
+## Core Features
+### Solo
+- **Auth**: JWT email/password; AsyncStorage Bearer token.
+- **Character**: Renamable, HUD avatar, overall level, 6 status bars (Health/Hunger/Hygiene/Energy/Social/Mood) with -10/-5/+5/+10 controls clamped 0–100.
+- **Skill Trees**: Fully custom skills (name, color, description). Per-skill progression LV1→2 = 100 XP, +150 XP per subsequent level (giant levels).
+- **Quests**: Create personal quests with XP rewards. Completing a skill-linked quest **auto-awards XP to that skill** with toast confirmation.
+
+### Social (NEW)
+- **Friend Codes**: Every user gets a unique 6-char code (A-Z, 0-9) auto-generated on register.
+- **Friend Requests**: Send by code → recipient accepts or declines.
+- **Relationship Bar**: 0–100, starts at 50 on accept. Visualized per-friend (green ≥70, yellow ≥35, red <35).
+- **View Profiles**: Tap a friend → see everything: character name, level, all 6 status bars, full skill tree, current relationship.
+- **Assign Quests**: Send a quest to a friend with title, description, XP reward, optional target skill (from THEIR skill tree), optional deadline (days).
+- **Quest Lifecycle**:
+  - `pending` → recipient can ACCEPT or DECLINE
+  - `accepted` → recipient can MARK COMPLETE or GIVE UP
+  - `completed` → relationship +max(1, xp//5) AND XP awarded to recipient's skill
+  - `declined` / `expired` → relationship -max(1, xp//5)
+  - Deadlines auto-expire on next quests fetch.
+- **Quests Tab Filter**: MINE / FROM FRIENDS / SENT.
 
 ## Backend Stack
-FastAPI + MongoDB (motor) + bcrypt + PyJWT. All routes prefixed `/api`. Collections: `users`, `skills`, `quests`.
+FastAPI + MongoDB (motor) + bcrypt + PyJWT. Collections: `users`, `skills`, `quests`, `friendships`. All routes prefixed `/api`.
 
 ## Frontend Stack
-Expo Router (file-based), React Native, axios, AsyncStorage, @expo/vector-icons.
+Expo Router (file-based), React Native, axios, AsyncStorage, @expo/vector-icons. 5 bottom tabs: Character / Skills / Quests / Friends / Profile. Modal stack: `/friend/[id]` for profile views.
 
-## Smart Business Enhancement
-The XP/level economy is intentionally tunable per skill — future monetization could offer "premium quest packs" (curated quest templates for fitness, learning, mindfulness) sold as one-time IAPs, plus a Pro tier unlocking unlimited skills/custom HUD themes. Daily streak tracking + push reminders would drive D7/D30 retention.
+## Smart Business Hook
+The relationship bar transforms LIFETRACK_OS into a **viral social accountability platform** — friends pressuring each other to follow through on real-world goals. Future monetization: premium quest pack IAPs, group challenges (3+ friends compete), public leaderboards by relationship score, push notifications for incoming quests/expiring deadlines (drives D1/D7 retention via social loop).
 
 ## Files
 - Backend: `/app/backend/server.py`, `/app/backend/.env`
-- Frontend: `/app/frontend/app/{_layout,index,login,register}.tsx`, `/app/frontend/app/(tabs)/{_layout,character,skills,quests,profile}.tsx`, `/app/frontend/lib/{api.ts,auth.tsx,theme.ts}`
+- Frontend: `/app/frontend/app/(tabs)/{character,skills,quests,friends,profile}.tsx`, `/app/frontend/app/friend/[id].tsx`, `/app/frontend/lib/{api.ts,auth.tsx,theme.ts}`
