@@ -1,0 +1,45 @@
+{
+  "summary": "Iteration 3 - Sub-skill branching with cascading XP fully tested. Backend: 12 new pytest cases + 29 pre-existing all passing (41/41 total). Verified: sub-skill creation with parent_id, invalid parent -> 400, flat-list with new fields (parent_id/own_xp/total_xp/depth/has_children/level/current_xp/next_level_xp), 2-level cascade (Guitar/Bar Chords +120XP -> both total_xp=120, Guitar own_xp=0 Bar own_xp=120 lvl=2), 3-level cascade (Guitar/Bar/PowerF +50 leaf -> all total_xp=50), PUT change parent OK, cycle protection self+descendant both return 400 'cycle', DELETE cascades descendants (removed_count/removed_ids correct), quests pointing to any removed skill -> skill_id=null, character.total_xp = sum of own_xp (no double-count), profile returns tree-shaped skills array, quest on sub-skill complete awards own_xp to sub-skill AND cascades to ancestors. Found + FIXED a critical bug: complete_quest was still writing to legacy 'total_xp' field instead of new 'xp' field (schema-migration miss) - after fix all tests green. Frontend (mobile 390x844): created Guitar root + Bar Chords sub via SUB button; modal title correctly shows '> NEW SUB-SKILL -> GUITAR'; tree renders with depth indent + branch line; toggle chevron collapses/expands children; +25 XP on sub-skill twice visibly propagates to parent's XP bar (Guitar 50/100 OWN 0 displayed). All testIDs present: add-skill-button, skill-<id>, add-sub-<id>, toggle-<id>, xp-25-<id>, edit-skill-<id>, delete-skill-<id>, skill-name-input, save-skill-button.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_skill_tree_iter3.py",
+    "/app/test_reports/pytest/iter3_results.xml"
+  ],
+  "action_items": [
+    "None blocking - all iteration-3 acceptance criteria met.",
+    "Low priority: server.py now ~955 lines, exceeds 700-line soft-limit. Consider splitting skills/quests/friends into submodules next iteration."
+  ],
+  "critical_code_review_comments": [
+    "FIXED during testing: complete_quest() in server.py (line ~674-680) was reading/writing legacy 'total_xp' field after schema migration to 'xp'. Meant completing a self-quest or friend-quest would write XP to a dead field; _own_xp() prefers new 'xp' so the skill appeared to gain no XP and no cascading to ancestors. Patched to use _own_xp() + set 'xp' + $unset legacy 'total_xp'. Added regression test test_quest_complete_cascades_to_ancestors.",
+    "serialize_skills_tree correctly computes total_xp via DFS with memo cache; depth loop guards against cycles via seen-set.",
+    "_would_cycle walks up new_parent chain and correctly rejects self and descendant assignments.",
+    "DELETE /skills/{id} + 'skill_id: null' on orphaned quests verified end-to-end.",
+    "uncomplete_quest already uses new schema correctly (sets 'xp', unsets 'total_xp').",
+    "Profile route serializes tree using same serialize_skills_tree helper - shape parity confirmed.",
+    "xp_required_for_level(level) = 100 + (level-1)*150 -> thresholds 100, 250, 400, ... Level 2 reached at 100 XP matches spec (Bar Chords 120 XP -> lvl 2 verified).",
+    "character.total_xp correctly sums own_xp only (no double-count from cascading) - verified numerically 30+70=100.",
+    "Frontend tree build uses byParent bucket + DFS walk; collapse state per-id; proper depth indent (18px/level) + branch-line marker - renders cleanly on mobile."
+  ],
+  "updated_files": [
+    "/app/backend/server.py (fixed complete_quest XP field from legacy total_xp to new xp)",
+    "/app/backend/tests/test_skill_tree_iter3.py (new, 12 tests)"
+  ],
+  "success_rate": {
+    "backend": "100% (12/12 new iter3 + 29/29 pre-existing iter1+iter2 = 41/41)",
+    "frontend": "100% of critical flows (create root, create sub via SUB button, cascading XP visible in parent bar, chevron toggle collapse/expand, tree indent with branch line)"
+  },
+  "seed_data_creation": "Test users TEST_iter3_<rand>@nexus.com (pytest) and uitest_<rand>@nexus.com (playwright) created via /api/auth/register. Left in DB - prefix-labeled for easy cleanup.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend URL env = EXPO_PUBLIC_BACKEND_URL. Admin: admin@nexus.com/admin123. Skill schema uses 'xp' field (legacy 'total_xp' in DB is auto-migrated on read via _own_xp helper; writes should always use 'xp' with $unset total_xp). Cascading math lives in serialize_skills_tree - don't recompute elsewhere. Cycle protection via _would_cycle. DELETE cascades via _descendant_ids + nullifies quest.skill_id. Frontend testIDs for skill tree: add-skill-button, skill-<id>, add-sub-<id>, toggle-<id>, xp-25-<id>, edit-skill-<id>, delete-skill-<id>, skill-name-input, save-skill-button. Modal title with parent: '> NEW SUB-SKILL -> <PARENT_NAME>'. Delete confirms with cascade warning when has_children=true.",
+  "rca_of_issue": "Bug: complete_quest() was untouched by the iter3 schema migration. It did skill.get('total_xp',0) + xp_reward and wrote back 'total_xp'. Since new skills are created with xp=0 and _own_xp() prefers 'xp', the write to 'total_xp' was ignored everywhere downstream -> sub-skill got no XP, no cascading, no level up. Reproduction: create skill, create quest pointed at it, POST /quests/<id>/complete, then GET /skills -> own_xp still 0. Fix: mirror uncomplete_quest pattern - compute new_own = _own_xp(skill) + xp_reward, $set xp=new_own, $unset total_xp. Regression test added."
+}

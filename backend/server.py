@@ -144,12 +144,14 @@ class SkillCreate(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     description: Optional[str] = ""
     color: Optional[str] = "#00F0FF"
+    parent_id: Optional[str] = None
 
 
 class SkillUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     color: Optional[str] = None
+    parent_id: Optional[str] = None
 
 
 class XPGain(BaseModel):
@@ -238,8 +240,8 @@ async def me(user: dict = Depends(get_current_user)):
 # ---------------- Character Routes ----------------
 @api_router.get("/character")
 async def get_character(user: dict = Depends(get_current_user)):
-    skills = await db.skills.find({"user_id": user["id"]}, {"_id": 0}).to_list(1000)
-    total_xp = sum(s.get("total_xp", 0) for s in skills)
+    skills = await _user_skills(user["id"])
+    total_xp = sum(_own_xp(s) for s in skills)
     # Overall level: every 500 XP
     overall_level = 1 + total_xp // 500
     return {
@@ -298,27 +300,129 @@ def compute_skill_level(total_xp: int) -> dict:
     }
 
 
+def _own_xp(s: dict) -> int:
+    # Migration-friendly: prefer new `xp` field; fall back to legacy `total_xp` if present
+    if "xp" in s:
+        return int(s.get("xp", 0))
+    return int(s.get("total_xp", 0))
+
+
+def serialize_skills_tree(skills: List[dict]) -> List[dict]:
+    by_id = {s["id"]: s for s in skills}
+    children_of = {s["id"]: [] for s in skills}
+    for s in skills:
+        pid = s.get("parent_id")
+        if pid and pid in children_of:
+            children_of[pid].append(s["id"])
+    total_cache: Dict[str, int] = {}
+
+    def total(sid: str) -> int:
+        if sid in total_cache:
+            return total_cache[sid]
+        own = _own_xp(by_id[sid])
+        t = own + sum(total(c) for c in children_of[sid])
+        total_cache[sid] = t
+        return t
+
+    def depth(sid: str) -> int:
+        d, cur = 0, by_id[sid]
+        seen = {sid}
+        while cur.get("parent_id"):
+            pid = cur["parent_id"]
+            if pid in seen or pid not in by_id:
+                break
+            seen.add(pid)
+            cur = by_id[pid]
+            d += 1
+        return d
+
+    out = []
+    for s in skills:
+        t = total(s["id"])
+        info = compute_skill_level(t)
+        out.append({
+            "id": s["id"],
+            "name": s["name"],
+            "description": s.get("description", ""),
+            "color": s.get("color", "#00F0FF"),
+            "parent_id": s.get("parent_id"),
+            "own_xp": _own_xp(s),
+            "total_xp": t,
+            "depth": depth(s["id"]),
+            "has_children": len(children_of[s["id"]]) > 0,
+            **info,
+        })
+    return out
+
+
 def serialize_skill(s: dict) -> dict:
-    info = compute_skill_level(s.get("total_xp", 0))
+    """Single-skill serialization (no tree context). Used in places that don't need totals."""
+    own = _own_xp(s)
+    info = compute_skill_level(own)
     return {
         "id": s["id"],
         "name": s["name"],
         "description": s.get("description", ""),
         "color": s.get("color", "#00F0FF"),
-        "total_xp": s.get("total_xp", 0),
+        "parent_id": s.get("parent_id"),
+        "own_xp": own,
+        "total_xp": own,
+        "depth": 0,
+        "has_children": False,
         **info,
     }
 
 
+async def _user_skills(user_id: str) -> List[dict]:
+    return await db.skills.find({"user_id": user_id}, {"_id": 0}).to_list(2000)
+
+
+async def _would_cycle(user_id: str, skill_id: str, new_parent_id: Optional[str]) -> bool:
+    if not new_parent_id:
+        return False
+    if new_parent_id == skill_id:
+        return True
+    # Walk up new_parent chain — if we hit skill_id, it's a cycle
+    cur = await db.skills.find_one({"id": new_parent_id, "user_id": user_id}, {"_id": 0, "parent_id": 1})
+    seen = set()
+    while cur and cur.get("parent_id"):
+        pid = cur["parent_id"]
+        if pid == skill_id:
+            return True
+        if pid in seen:
+            return True
+        seen.add(pid)
+        cur = await db.skills.find_one({"id": pid, "user_id": user_id}, {"_id": 0, "parent_id": 1})
+    return False
+
+
+async def _descendant_ids(user_id: str, root_id: str) -> List[str]:
+    all_skills = await _user_skills(user_id)
+    children_of: Dict[str, List[str]] = {}
+    for s in all_skills:
+        children_of.setdefault(s.get("parent_id"), []).append(s["id"])
+    out: List[str] = []
+    stack = [root_id]
+    while stack:
+        sid = stack.pop()
+        out.append(sid)
+        stack.extend(children_of.get(sid, []))
+    return out
+
+
 @api_router.get("/skills")
 async def list_skills(user: dict = Depends(get_current_user)):
-    skills = await db.skills.find({"user_id": user["id"]}, {"_id": 0}).to_list(1000)
+    skills = await _user_skills(user["id"])
     skills.sort(key=lambda x: x.get("created_at", ""))
-    return [serialize_skill(s) for s in skills]
+    return serialize_skills_tree(skills)
 
 
 @api_router.post("/skills")
 async def create_skill(payload: SkillCreate, user: dict = Depends(get_current_user)):
+    if payload.parent_id:
+        parent = await db.skills.find_one({"id": payload.parent_id, "user_id": user["id"]})
+        if not parent:
+            raise HTTPException(status_code=400, detail="Parent skill not found")
     skill_id = str(uuid.uuid4())
     doc = {
         "id": skill_id,
@@ -326,12 +430,13 @@ async def create_skill(payload: SkillCreate, user: dict = Depends(get_current_us
         "name": payload.name.strip(),
         "description": (payload.description or "").strip(),
         "color": payload.color or "#00F0FF",
-        "total_xp": 0,
+        "parent_id": payload.parent_id,
+        "xp": 0,
         "created_at": now_iso(),
     }
     await db.skills.insert_one(doc)
-    doc.pop("_id", None)
-    return serialize_skill(doc)
+    skills = await _user_skills(user["id"])
+    return next((s for s in serialize_skills_tree(skills) if s["id"] == skill_id), serialize_skill(doc))
 
 
 @api_router.put("/skills/{skill_id}")
@@ -339,21 +444,34 @@ async def update_skill(skill_id: str, payload: SkillUpdate, user: dict = Depends
     skill = await db.skills.find_one({"id": skill_id, "user_id": user["id"]}, {"_id": 0})
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    update = {k: v for k, v in payload.model_dump(exclude_none=True).items() if k != "parent_id"}
+    # Special handling for parent_id (allow setting null too, but only if explicitly provided)
+    raw = payload.model_dump(exclude_unset=True)
+    if "parent_id" in raw:
+        new_parent = raw["parent_id"]
+        if new_parent and new_parent != skill.get("parent_id"):
+            parent = await db.skills.find_one({"id": new_parent, "user_id": user["id"]})
+            if not parent:
+                raise HTTPException(status_code=400, detail="Parent skill not found")
+        if await _would_cycle(user["id"], skill_id, new_parent):
+            raise HTTPException(status_code=400, detail="Cannot set parent: would create a cycle")
+        update["parent_id"] = new_parent
     if update:
         await db.skills.update_one({"id": skill_id}, {"$set": update})
-    skill = await db.skills.find_one({"id": skill_id}, {"_id": 0})
-    return serialize_skill(skill)
+    skills = await _user_skills(user["id"])
+    return next((s for s in serialize_skills_tree(skills) if s["id"] == skill_id), serialize_skill(skill))
 
 
 @api_router.delete("/skills/{skill_id}")
 async def delete_skill(skill_id: str, user: dict = Depends(get_current_user)):
-    res = await db.skills.delete_one({"id": skill_id, "user_id": user["id"]})
-    if res.deleted_count == 0:
+    skill = await db.skills.find_one({"id": skill_id, "user_id": user["id"]})
+    if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    # Unlink quests pointing to this skill
-    await db.quests.update_many({"user_id": user["id"], "skill_id": skill_id}, {"$set": {"skill_id": None}})
-    return {"deleted": True}
+    ids_to_remove = await _descendant_ids(user["id"], skill_id)
+    await db.skills.delete_many({"id": {"$in": ids_to_remove}, "user_id": user["id"]})
+    # Unlink quests pointing to deleted skills
+    await db.quests.update_many({"skill_id": {"$in": ids_to_remove}}, {"$set": {"skill_id": None}})
+    return {"deleted": True, "removed_count": len(ids_to_remove), "removed_ids": ids_to_remove}
 
 
 @api_router.post("/skills/{skill_id}/xp")
@@ -361,10 +479,10 @@ async def add_xp(skill_id: str, payload: XPGain, user: dict = Depends(get_curren
     skill = await db.skills.find_one({"id": skill_id, "user_id": user["id"]}, {"_id": 0})
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    new_total = max(0, skill.get("total_xp", 0) + payload.amount)
-    await db.skills.update_one({"id": skill_id}, {"$set": {"total_xp": new_total}})
-    skill["total_xp"] = new_total
-    return serialize_skill(skill)
+    new_own = max(0, _own_xp(skill) + payload.amount)
+    await db.skills.update_one({"id": skill_id}, {"$set": {"xp": new_own}, "$unset": {"total_xp": ""}})
+    skills = await _user_skills(user["id"])
+    return next((s for s in serialize_skills_tree(skills) if s["id"] == skill_id), serialize_skill(skill))
 
 
 # ---------------- Quests Routes ----------------
@@ -556,9 +674,10 @@ async def complete_quest(quest_id: str, user: dict = Depends(get_current_user)):
     if quest.get("skill_id"):
         skill = await db.skills.find_one({"id": quest["skill_id"], "user_id": recipient_id}, {"_id": 0})
         if skill:
-            new_total = skill.get("total_xp", 0) + quest.get("xp_reward", 0)
-            await db.skills.update_one({"id": skill["id"]}, {"$set": {"total_xp": new_total}})
-            skill["total_xp"] = new_total
+            new_own = _own_xp(skill) + quest.get("xp_reward", 0)
+            await db.skills.update_one({"id": skill["id"]}, {"$set": {"xp": new_own}, "$unset": {"total_xp": ""}})
+            skill["xp"] = new_own
+            skill.pop("total_xp", None)
             awarded_skill = serialize_skill(skill)
     new_rel = None
     if is_friend_quest:
@@ -587,8 +706,8 @@ async def uncomplete_quest(quest_id: str, user: dict = Depends(get_current_user)
     if quest.get("skill_id"):
         skill = await db.skills.find_one({"id": quest["skill_id"], "user_id": recipient_id}, {"_id": 0})
         if skill:
-            new_total = max(0, skill.get("total_xp", 0) - quest.get("xp_reward", 0))
-            await db.skills.update_one({"id": skill["id"]}, {"$set": {"total_xp": new_total}})
+            new_own = max(0, _own_xp(skill) - quest.get("xp_reward", 0))
+            await db.skills.update_one({"id": skill["id"]}, {"$set": {"xp": new_own}, "$unset": {"total_xp": ""}})
     if quest.get("from_user_id"):
         await adjust_relationship(quest["from_user_id"], user["id"], -relationship_delta_for(quest.get("xp_reward", 0)))
     quest = await db.quests.find_one({"id": quest_id}, {"_id": 0})
@@ -691,8 +810,8 @@ async def list_friends(user: dict = Depends(get_current_user)):
         if not other:
             continue
         # Compute their level from skills
-        skills = await db.skills.find({"user_id": other_id}, {"_id": 0, "total_xp": 1}).to_list(1000)
-        total_xp = sum(s.get("total_xp", 0) for s in skills)
+        skills = await _user_skills(other_id)
+        total_xp = sum(_own_xp(s) for s in skills)
         overall_level = 1 + total_xp // 500
         friends.append({
             "user_id": other_id,
@@ -727,8 +846,8 @@ async def view_profile(user_id: str, user: dict = Depends(get_current_user)):
         target = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
-    skills = await db.skills.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
-    total_xp = sum(s.get("total_xp", 0) for s in skills)
+    skills = await _user_skills(user_id)
+    total_xp = sum(_own_xp(s) for s in skills)
     overall_level = 1 + total_xp // 500
     relationship = None
     if user_id != user["id"]:
@@ -742,7 +861,7 @@ async def view_profile(user_id: str, user: dict = Depends(get_current_user)):
         "overall_level": overall_level,
         "total_xp": total_xp,
         "next_level_xp": overall_level * 500,
-        "skills": [serialize_skill(s) for s in skills],
+        "skills": serialize_skills_tree(skills),
         "relationship": relationship,
     }
 
