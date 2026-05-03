@@ -954,7 +954,7 @@ async def shutdown_db_client():
     client.close()
 
 
-if__name__=="__main":
+if __name__=="__main":
     import uvicorn
     import os
     port=int(os.environ.get("PORT",10000))
